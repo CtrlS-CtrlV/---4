@@ -1,0 +1,168 @@
+/* 
+ * прозора шифрована файлова система на базі FUSE 3
+ */
+
+#define FUSE_USE_VERSION 31
+
+#include <fuse.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <errno.h>
+#include <libgen.h>
+
+static const char *dirpath = "./encrypted_storage";
+static const char ENCRYPTION_KEY = 0xAA; /* Простий XOR ключ для демонстрації */
+
+/*  (XOR-трансформація) */
+void cipher_data(char *data, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        data[i] ^= ENCRYPTION_KEY;
+    }
+}
+
+/* Отримання шляху у сховищі */
+static void get_real_path(char *fpath, const char *path) {
+    strcpy(fpath, dirpath);
+    strncat(fpath, path, PATH_MAX - strlen(dirpath) - 1);
+}
+
+static int enc_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi) {
+    (void) fi;
+    char fpath[PATH_MAX];
+    get_real_path(fpath, path);
+
+    int res = lstat(fpath, stbuf);
+    if (res == -1) return -errno;
+    return 0;
+}
+
+static int enc_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+                       off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags) {
+    (void) offset; (void) fi; (void) flags;
+    char fpath[PATH_MAX];
+    get_real_path(fpath, path);
+
+    DIR *dp = opendir(fpath);
+    if (dp == NULL) return -errno;
+
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        struct stat st;
+        memset(&st, 0, sizeof(st));
+        st.st_ino = de->d_ino;
+        st.st_mode = de->d_type << 12;
+        if (filler(buf, de->d_name, &st, 0, 0)) break;
+    }
+    closedir(dp);
+    return 0;
+}
+
+static int enc_open(const char *path, struct fuse_file_info *fi) {
+    char fpath[PATH_MAX];
+    get_real_path(fpath, path);
+
+    int res = open(fpath, fi->flags);
+    if (res == -1) return -errno;
+    close(res);
+    return 0;
+}
+
+static int enc_read(const char *path, char *buf, size_t size, off_t offset,
+                    struct fuse_file_info *fi) {
+    (void) fi;
+    char fpath[PATH_MAX];
+    get_real_path(fpath, path);
+
+    int fd = open(fpath, O_RDONLY);
+    if (fd == -1) return -errno;
+
+    int res = pread(fd, buf, size, offset);
+    if (res == -1) {
+        res = -errno;
+    } else if (res > 0) {
+        /* Прозоре дешифрування прочитаних даних перед відправкою користувачу */
+        cipher_data(buf, res);
+    }
+    close(fd);
+    return res;
+}
+
+static int enc_write(const char *path, const char *buf, size_t size, off_t offset,
+                     struct fuse_file_info *fi) {
+    (void) fi;
+    char fpath[PATH_MAX];
+    get_real_path(fpath, path);
+
+    int fd = open(fpath, O_WRONLY);
+    if (fd == -1) return -errno;
+
+    /* Створення копії даних для шифрування перед записом на диск */
+    char *encrypted_buf = malloc(size);
+    if (!encrypted_buf) {
+        close(fd);
+        return -ENOMEM;
+    }
+    memcpy(encrypted_buf, buf, size);
+    cipher_data(encrypted_buf, size);
+
+    int res = pwrite(fd, encrypted_buf, size, offset);
+    if (res == -1) res = -errno;
+
+    free(encrypted_buf);
+    close(fd);
+    return res;
+}
+
+static int enc_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
+    (void) fi;
+    char fpath[PATH_MAX];
+    get_real_path(fpath, path);
+
+    int res = creat(fpath, mode);
+    if (res == -1) return -errno;
+    close(res);
+    return 0;
+}
+
+static int enc_mkdir(const char *path, mode_t mode) {
+    char fpath[PATH_MAX];
+    get_real_path(fpath, path);
+
+    int res = mkdir(fpath, mode);
+    if (res == -1) return -errno;
+    return 0;
+}
+
+static int enc_unlink(const char *path) {
+    char fpath[PATH_MAX];
+    get_real_path(fpath, path);
+
+    int res = unlink(fpath);
+    if (res == -1) return -errno;
+    return 0;
+}
+
+static struct fuse_operations enc_oper = {
+    .getattr   = enc_getattr,
+    .readdir   = enc_readdir,
+    .open      = enc_open,
+    .read      = enc_read,
+    .write     = enc_write,
+    .create    = enc_create,
+    .mkdir     = enc_mkdir,
+    .unlink    = enc_unlink,
+};
+
+int main(int argc, char *argv[]) {
+    // Створення фізичної директорії сховища, якщо вона відсутня
+    struct stat st = {0};
+    if (stat(dirpath, &st) == -1) {
+        mkdir(dirpath, 0700);
+    }
+    return fuse_main(argc, argv, &enc_oper, NULL);
+}
